@@ -45,6 +45,14 @@
 
 #include "testmachine/dev_ether.h"
 
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <poll.h>
 
 #define	DEV_ETHER_TICK_SHIFT	14
 
@@ -56,6 +64,9 @@ struct ether_data {
 	int			packet_len;
 
 	struct interrupt	irq;
+
+	/** File descriptor of TAP interface. */
+	int tap_fd;
 };
 
 
@@ -65,9 +76,11 @@ DEVICE_TICK(ether)
 	int r = 0;
 
 	d->status &= ~DEV_ETHER_STATUS_MORE_PACKETS_AVAILABLE;
-	if (cpu->machine->emul->net != NULL)
-		r = net_ethernet_rx_avail(cpu->machine->emul->net, d);
-	if (r)
+
+	struct pollfd pfd = { .fd = d->tap_fd, .events=POLLIN };
+	(void)poll(&pfd, 1, 0);
+
+	if (pfd.revents & POLLIN)
 		d->status |= DEV_ETHER_STATUS_MORE_PACKETS_AVAILABLE;
 
 	if (d->status)
@@ -146,16 +159,9 @@ DEVICE_ACCESS(ether)
 				fatal("[ ether: RECEIVE but no net? ]\n");
 			else {
 				d->status &= ~DEV_ETHER_STATUS_PACKET_RECEIVED;
-				if (net_ethernet_rx(cpu->machine->emul->net,
-				    d, &incoming_ptr, &incoming_len)) {
-					d->status |=
-					    DEV_ETHER_STATUS_PACKET_RECEIVED;
-					if (incoming_len>DEV_ETHER_BUFFER_SIZE)
-						incoming_len =
-						    DEV_ETHER_BUFFER_SIZE;
-					memcpy(d->buf, incoming_ptr,
-					    incoming_len);
-					free(incoming_ptr);
+				incoming_len = read(d->tap_fd, d->buf, DEV_ETHER_BUFFER_SIZE);
+				if (incoming_len != (-1)) {
+					d->status |= DEV_ETHER_STATUS_PACKET_RECEIVED;
 					d->packet_len = incoming_len;
 				}
 			}
@@ -166,8 +172,7 @@ DEVICE_ACCESS(ether)
 			if (cpu->machine->emul->net == NULL)
 				fatal("[ ether: SEND but no net? ]\n");
 			else
-				net_ethernet_tx(cpu->machine->emul->net,
-				    d, d->buf, d->packet_len);
+				(void)write(d->tap_fd, d->buf, d->packet_len);
 			d->status &= ~DEV_ETHER_STATUS_PACKET_RECEIVED;
 			dev_ether_tick(cpu, d);
 			break;
@@ -241,6 +246,22 @@ DEVINIT(ether)
 
 	machine_add_tickfunction(devinit->machine,
 	    dev_ether_tick, d, DEV_ETHER_TICK_SHIFT);
+
+	/* Initialize TAP interface.
+	 * Must be root!
+	 */
+	struct ifreq ifr = {};
+	ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+	d->tap_fd = open("/dev/net/tun", O_RDWR);
+	if(d->tap_fd < 0) {
+		/* FIXME */
+		fprintf(stderr, "Could not open TAP device!\n");
+		exit(1);
+	}
+	if(ioctl(d->tap_fd, TUNSETIFF, (void*)&ifr) < 0) {
+		fprintf(stderr, "Could not configure TAP device!\n");
+		exit(1);
+	}
 
 	return 1;
 }
